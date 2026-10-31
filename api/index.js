@@ -4,7 +4,11 @@ const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3900;
 const SERPER_TIMEOUT_MS = 1600;
-const GEMINI_TIMEOUT_MS = 2500;
+// 600 ms remain outside this handler for network/platform overhead (4500 - 3900).
+// Reserve another 150 ms inside the handler for building and sending the response.
+const RESPONSE_RESERVE_MS = 150;
+const MIN_GEMINI_BUDGET_MS = 2100;
+const GEMINI_TIMEOUT_MS = TOTAL_RESPONSE_BUDGET_MS - RESPONSE_RESERVE_MS;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -57,15 +61,37 @@ function safeHistory(history) {
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
 }
 
-async function fetchJson(url, options, timeoutMs) {
+function isTimeout(error) {
+  return error?.name === "AbortError" || error?.name === "TimeoutError" ||
+    error?.message === "TIME_BUDGET_EXHAUSTED";
+}
+
+async function fetchJson(url, options, timeoutMs, stage) {
+  if (timeoutMs <= 0) throw new Error("TIME_BUDGET_EXHAUSTED");
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const startedAt = performance.now();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let status;
+  let outcome = "error";
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json().catch(() => ({}));
+    status = response.status;
+    // Keep the deadline active while reading the body; do not swallow aborts.
+    const data = await response.json().catch(error => {
+      if (isTimeout(error) || response.ok) throw error;
+      return {}; // Preserve HTTP error classification for non-JSON error pages.
+    });
+    outcome = response.ok ? "ok" : "http_error";
     return { response, data };
+  } catch (error) {
+    outcome = isTimeout(error) ? "timeout" : "error";
+    throw error;
   } finally {
     clearTimeout(timer);
+    console.info("upstream_timing", {
+      stage, outcome, status, timeoutMs,
+      elapsedMs: Math.round(performance.now() - startedAt)
+    });
   }
 }
 
@@ -84,7 +110,8 @@ async function searchWeb(query, timeoutMs) {
         },
         body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
       },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+      Math.min(SERPER_TIMEOUT_MS, timeoutMs),
+      "serper"
     );
 
     if (!response.ok) {
@@ -105,7 +132,7 @@ async function searchWeb(query, timeoutMs) {
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
+    console.warn("Serper unavailable:", isTimeout(error) ? "timeout" : "request_error");
     return "";
   }
 }
@@ -145,7 +172,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(GEMINI_TIMEOUT_MS, timeoutMs),
+    "gemini"
   );
 
   if (!response.ok) {
@@ -173,6 +201,9 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 }
 
 function errorForUser(error) {
+  if (isTimeout(error)) {
+    return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
+  }
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
       return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
@@ -204,8 +235,8 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const startedAt = Date.now();
-  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+  const startedAt = performance.now();
+  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (performance.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
@@ -221,15 +252,24 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 1900)));
+      // Search may use only the time left after reserving generation and response time.
+      searchContext = await searchWeb(text, Math.min(
+        SERPER_TIMEOUT_MS,
+        Math.max(0, remainingMs() - RESPONSE_RESERVE_MS - MIN_GEMINI_BUDGET_MS)
+      ));
+      if (!searchContext) {
+        return res.status(200).json(aliceResponse(
+          "Не удалось получить актуальные данные из поиска. Попробуйте ещё раз чуть позже.",
+          false, oldHistory
+        ));
+      }
     }
 
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - RESPONSE_RESERVE_MS))
     );
 
     const history = [
@@ -240,9 +280,11 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = isTimeout(error) ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+  } finally {
+    console.info("alice_timing", { elapsedMs: Math.round(performance.now() - startedAt) });
   }
 }
 
