@@ -55,16 +55,31 @@ function isSearchIntent(text) {
   return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свеж|новейш|новинк|новый|нового|новые|новых|интернет|на\s+сайте|сайт\s+|20\d{2}/i.test(text);
 }
 
+function searchTopic(text) {
+  return String(text)
+    .replace(/(?:за\s+источник\s+возьми\s+)?(?:на\s+)?(?:официальном\s+)?сайт(?:е)?\s+(?:apple(?:\.com)?|эппл)/gi, " ")
+    .replace(/site:apple\.com/gi, " ")
+    .replace(/(?:проверь|найди|поищи|посмотри)\s+(?:это\s+)?(?:в\s+интернете|онлайн)/gi, " ")
+    .replace(/(?:и\s+)?ответь\s+(?:снова\s+)?(?:на\s+)?(?:этот|тот\s+же)\s+вопрос/gi, " ")
+    .replace(/(?:повтори|перепроверь)\s+(?:ответ|это)/gi, " ")
+    .replace(/^[\s,.:;!?—-]+|[\s,.:;!?—-]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function buildSearchPlan(text, history) {
-  const previous = safeHistory(history).filter(item => item.role === "user").slice(-2);
+  const previous = safeHistory(history).filter(item => item.role === "user");
   const refersBack = /этот вопрос|на него|снова|ещ[её]|а как|а что|а какой|подробнее/i.test(text);
-  const context = refersBack ? previous.map(item => item.text).join(" ") : "";
+  const topic = searchTopic(text);
+  // Skip previous instructions with no topic; never use model answers as search facts.
+  const previousTopic = [...previous].reverse().map(item => searchTopic(item.text)).find(Boolean) || "";
+  const context = refersBack ? previousTopic : "";
   const needed = isSearchIntent(text) || (refersBack && previous.some(item => isSearchIntent(item.text)));
-  const sourceRequest = `${context} ${text}`;
-  // Enforce the explicitly requested Apple source in both query and returned links.
+  const sourceRequest = `${refersBack ? previous.map(item => item.text).join(" ") : ""} ${text}`;
   const domain = /(?:сайт|источник)[\s\S]{0,100}(?:apple|эппл)|apple\.com/i.test(sourceRequest)
     ? "apple.com" : "";
-  const query = [domain ? `site:${domain}` : "", context, text].filter(Boolean).join(" ").slice(0, 3000);
+  const subject = [...new Set([context, topic].filter(Boolean))].join(" ");
+  const query = subject ? [domain ? `site:${domain}` : "", subject].filter(Boolean).join(" ").slice(0, 1500) : "";
   return { needed, query, domain };
 }
 
@@ -277,6 +292,11 @@ export default async function handler(req, res) {
     let searchContext = "";
     const searchPlan = buildSearchPlan(text, oldHistory);
     if (searchPlan.needed) {
+      if (!searchPlan.query) {
+        return res.status(200).json(aliceResponse(
+          "Что именно нужно проверить в интернете? Назовите тему вопроса.", false, oldHistory
+        ));
+      }
       // Search may use only the time left after reserving generation and response time.
       searchContext = await searchWeb(searchPlan.query, Math.min(
         SERPER_TIMEOUT_MS,
