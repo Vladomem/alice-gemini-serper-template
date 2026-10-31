@@ -3,11 +3,11 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3900;
-const SERPER_TIMEOUT_MS = 1600;
+const SERPER_TIMEOUT_MS = 2200;
 // 600 ms remain outside this handler for network/platform overhead (4500 - 3900).
 // Reserve another 150 ms inside the handler for building and sending the response.
 const RESPONSE_RESERVE_MS = 150;
-const MIN_GEMINI_BUDGET_MS = 2100;
+const MIN_GEMINI_BUDGET_MS = 1500;
 const GEMINI_TIMEOUT_MS = TOTAL_RESPONSE_BUDGET_MS - RESPONSE_RESERVE_MS;
 
 const SYSTEM_PROMPT = [
